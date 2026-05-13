@@ -1,6 +1,8 @@
 import io
+import time
 import requests
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 
 from ibm_watsonx_orchestrate.agent_builder.tools import tool
@@ -9,6 +11,8 @@ from ibm_watsonx_orchestrate.run import connections
 
 LANGFUSE_APP_ID = "m-langfuse"
 JST = timezone(timedelta(hours=9))
+# サービス本番開始: JST 2026/05/01 00:00 = UTC 2026/04/30 15:00
+SERVICE_START_UTC = datetime(2026, 4, 30, 15, 0, 0, tzinfo=timezone.utc)
 
 HEADER_BG = "375623"
 EVEN_ROW_BG = "EBF5E0"
@@ -46,60 +50,150 @@ def export_langfuse_sessions() -> bytes:
     secret_key = creds.get("LANGFUSE_SECRET_KEY")
     host = creds.get("LANGFUSE_HOST", "https://cloud.langfuse.com")
 
-    traces = _fetch_all_traces(public_key, secret_key, host)
-    rows = _aggregate_sessions(traces)
+    from_ts = SERVICE_START_UTC.isoformat()
+    traces = _fetch_all_traces(public_key, secret_key, host, from_ts)
+    obs_by_trace = _fetch_all_observations(public_key, secret_key, host, from_ts)
+    rows = _aggregate_sessions(traces, obs_by_trace)
     return _build_xlsx(rows)
 
 
 # ---------- Langfuse API ----------
 
-def _fetch_all_traces(public_key: str, secret_key: str, host: str) -> list:
-    traces = []
-    page = 1
-    while True:
-        response = requests.get(
-            f"{host}/api/public/traces",
+def _fetch_page(public_key: str, secret_key: str, host: str, endpoint: str, params: dict) -> list:
+    for attempt in range(4):
+        resp = requests.get(
+            f"{host}/api/public/{endpoint}",
             auth=(public_key, secret_key),
-            params={"page": page, "limit": 50},
+            params=params,
+            timeout=30,
         )
-        response.raise_for_status()
-        data = response.json()
-        items = data.get("data", [])
-        if not items:
-            break
-        traces.extend(items)
-        if len(items) < 50:
-            break
-        page += 1
-    return traces
+        if resp.status_code == 429:
+            time.sleep(0.5 * (2 ** attempt))
+            continue
+        resp.raise_for_status()
+        return resp.json().get("data", [])
+    return []
 
 
-def _get_user_message(trace: dict) -> str:
+def _fetch_all_pages(public_key: str, secret_key: str, host: str, endpoint: str, base_params: dict) -> list:
+    p1 = requests.get(
+        f"{host}/api/public/{endpoint}",
+        auth=(public_key, secret_key),
+        params={**base_params, "page": 1},
+        timeout=30,
+    )
+    p1.raise_for_status()
+    body = p1.json()
+    items = body.get("data", [])
+    meta = body.get("meta", {})
+    total_pages = meta.get("totalPages") or max(
+        1, (meta.get("totalItems", 0) + base_params["limit"] - 1) // base_params["limit"]
+    )
+
+    if total_pages <= 1:
+        return items
+
+    results = list(items)
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        futs = {
+            ex.submit(_fetch_page, public_key, secret_key, host, endpoint, {**base_params, "page": p}): p
+            for p in range(2, total_pages + 1)
+        }
+        for fut in as_completed(futs):
+            results.extend(fut.result())
+    return results
+
+
+def _fetch_all_traces(public_key: str, secret_key: str, host: str, from_timestamp: str) -> list:
+    return _fetch_all_pages(
+        public_key, secret_key, host,
+        "traces",
+        {"limit": 50, "fromTimestamp": from_timestamp},
+    )
+
+
+def _fetch_all_observations(public_key: str, secret_key: str, host: str, from_timestamp: str) -> dict:
+    """LangGraph observations を一括取得して {traceId: [obs, ...]} で返す。"""
+    items = _fetch_all_pages(
+        public_key, secret_key, host,
+        "observations",
+        {"limit": 50, "fromTimestamp": from_timestamp, "name": "LangGraph"},
+    )
+    obs_by_trace: dict = defaultdict(list)
+    for obs in items:
+        tid = obs.get("traceId", "")
+        if tid:
+            obs_by_trace[tid].append(obs)
+    return obs_by_trace
+
+
+def _get_user_message(trace: dict, obs_list: list | None = None) -> str:
     try:
-        for m in trace.get("input", {}).get("messages", []):
+        inp = trace.get("input") or {}
+        for m in inp.get("messages", []):
             if m.get("role") == "user":
-                return m.get("content", "")[:200]
+                content = m.get("content", "")
+                return (content if isinstance(content, str) else str(content))[:200]
     except Exception:
         pass
+    if obs_list:
+        for obs in obs_list:
+            try:
+                inp = obs.get("input") or {}
+                if isinstance(inp, dict):
+                    for m in inp.get("messages", []):
+                        if m.get("role") == "user":
+                            content = m.get("content", "")
+                            return (content if isinstance(content, str) else str(content))[:200]
+            except Exception:
+                pass
     return ""
 
 
-def _get_assistant_message(trace: dict) -> str:
+def _get_assistant_message(trace: dict, obs_list: list | None = None) -> str:
     try:
-        for m in trace.get("output", {}).get("messages", []):
+        out = trace.get("output") or {}
+        for m in out.get("messages", []):
             if m.get("role") == "assistant":
-                return m.get("content", "")[:200]
+                content = m.get("content", "")
+                return (content if isinstance(content, str) else str(content))[:200]
     except Exception:
         pass
+    if obs_list:
+        for obs in reversed(obs_list or []):
+            try:
+                out = obs.get("output") or {}
+                if isinstance(out, dict):
+                    for m in out.get("messages", []):
+                        if m.get("role") == "assistant":
+                            content = m.get("content", "")
+                            return (content if isinstance(content, str) else str(content))[:200]
+            except Exception:
+                pass
     return ""
 
 
-def _get_agent_info(trace: dict) -> tuple:
+def _get_agent_info(trace: dict, obs_list: list | None = None) -> tuple:
     try:
-        inp = trace.get("input", {})
-        return inp.get("current_agent_id", ""), inp.get("agent_display_name", "")
+        inp = trace.get("input") or {}
+        agent_id = inp.get("current_agent_id", "")
+        agent_name = inp.get("agent_display_name", "")
+        if agent_id or agent_name:
+            return agent_id, agent_name
     except Exception:
-        return "", ""
+        pass
+    if obs_list:
+        for obs in obs_list:
+            try:
+                inp = obs.get("input") or {}
+                if isinstance(inp, dict):
+                    agent_id = inp.get("current_agent_id", "")
+                    agent_name = inp.get("agent_display_name", "")
+                    if agent_id or agent_name:
+                        return agent_id, agent_name
+            except Exception:
+                pass
+    return "", ""
 
 
 def _to_jst(ts_str: str) -> str:
@@ -114,7 +208,7 @@ def _to_jst(ts_str: str) -> str:
 
 # ---------- 集計 ----------
 
-def _aggregate_sessions(traces: list) -> list:
+def _aggregate_sessions(traces: list, obs_by_trace: dict) -> list:
     sessions: dict = defaultdict(lambda: {
         "start_time": None,
         "turn_count": 0,
@@ -130,6 +224,7 @@ def _aggregate_sessions(traces: list) -> list:
         sid = t.get("sessionId", "unknown")
         ts = t.get("timestamp", "")
         s = sessions[sid]
+        obs_list = obs_by_trace.get(t.get("id", ""), [])
 
         if s["start_time"] is None or ts < s["start_time"]:
             s["start_time"] = ts
@@ -138,15 +233,15 @@ def _aggregate_sessions(traces: list) -> list:
         s["total_latency"] += t.get("latency") or 0.0
         s["userId"] = s["userId"] or t.get("userId", "")
 
-        agent_id, agent_name = _get_agent_info(t)
+        agent_id, agent_name = _get_agent_info(t, obs_list)
         s["agent_id"] = s["agent_id"] or agent_id
         s["agent_display_name"] = s["agent_display_name"] or agent_name
 
-        user_msg = _get_user_message(t)
+        user_msg = _get_user_message(t, obs_list)
         if user_msg and not s["first_user_message"]:
             s["first_user_message"] = user_msg
 
-        asst_msg = _get_assistant_message(t)
+        asst_msg = _get_assistant_message(t, obs_list)
         if asst_msg:
             s["last_assistant_message"] = asst_msg
 
