@@ -1,6 +1,7 @@
 .env
 *.csv
 *.xlsx
+*.json
 __pycache__/
 *.py[cod]
 .venv/
